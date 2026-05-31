@@ -4,7 +4,7 @@
 
 ## 使用
 
-1. 运行 `one_click_launcher.pyw`，或双击桌面的“一键启动”。
+1. 运行 `one_click_launcher.pyw`（Python环境）或者windows运行exe。
 2. 新建工作组。
 3. 添加要启动的文件、软件、文件夹或网址。
 4. 点击“创建桌面快捷方式”。
