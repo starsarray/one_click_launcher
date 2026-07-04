@@ -6,8 +6,10 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import uuid
 from pathlib import Path
+from urllib.parse import unquote
 from tkinter import (
     BOTH,
     END,
@@ -35,7 +37,12 @@ from tkinter import (
 
 
 APP_NAME = "一键启动"
+APP_VERSION = "v0.4.1-demo"
 CONFIG_FILE = "launcher_config.json"
+
+
+def default_config() -> dict:
+    return {"groups": [], "rule_groups": [], "active_rule_group_ids": []}
 
 
 class GUID(ctypes.Structure):
@@ -75,13 +82,19 @@ def config_path() -> Path:
 def load_config() -> dict:
     path = config_path()
     if not path.exists():
-        return {"groups": []}
+        return default_config()
     try:
         with path.open("r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
-        return {"groups": []}
+        return default_config()
     data.setdefault("groups", [])
+    data.setdefault("rule_groups", [])
+    if "active_rule_group_ids" not in data:
+        old_id = data.get("active_rule_group_id")
+        data["active_rule_group_ids"] = [old_id] if old_id else []
+    data["active_rule_group_ids"] = list(dict.fromkeys(group_id for group_id in data.get("active_rule_group_ids", []) if group_id))
+    data.pop("active_rule_group_id", None)
     return data
 
 
@@ -91,6 +104,8 @@ def save_config(data: dict) -> None:
 
 
 def is_url(target: str) -> bool:
+    if re.match(r"^[a-zA-Z]:[\\/]", target or ""):
+        return False
     return re.match(r"^[a-zA-Z][a-zA-Z0-9+.-]*:", target or "") is not None
 
 
@@ -124,6 +139,69 @@ def find_group(data: dict, key: str) -> dict | None:
     return None
 
 
+def find_rule_group(data: dict, key: str) -> dict | None:
+    for group in data.get("rule_groups", []):
+        if group.get("id") == key or group.get("name") == key:
+            return group
+    return None
+
+
+def normalize_rule_path(path: str) -> str:
+    value = expand_target(path or "").strip().strip('"')
+    if is_url(value):
+        return value.rstrip("/").lower()
+    try:
+        return os.path.normcase(str(Path(value).resolve()))
+    except Exception:
+        return os.path.normcase(value)
+
+
+def active_rule_group_ids(data: dict) -> list[str]:
+    ids = data.get("active_rule_group_ids", [])
+    if not ids and data.get("active_rule_group_id"):
+        ids = [data.get("active_rule_group_id")]
+    return list(dict.fromkeys(group_id for group_id in ids if group_id))
+
+
+def active_rule_groups(data: dict) -> list[dict]:
+    groups = []
+    for group_id in active_rule_group_ids(data):
+        group = find_rule_group(data, group_id)
+        if group:
+            groups.append(group)
+    return groups
+
+
+def active_rule_names(data: dict) -> list[str]:
+    return [group.get("name", "未命名规则组") for group in active_rule_groups(data)]
+
+
+def item_blocked_by_active_rules(data: dict, item: dict) -> bool:
+    groups = active_rule_groups(data)
+    if not groups:
+        return False
+
+    item_path = normalize_rule_path(item.get("path", ""))
+    item_args = (item.get("args", "") or "").strip()
+    merged_rules = set()
+    for group in groups:
+        for rule in group.get("rules", []):
+            if not rule.get("enabled", True):
+                continue
+            rule_path = normalize_rule_path(rule.get("path", ""))
+            rule_args = (rule.get("args", "") or "").strip()
+            if not rule_path:
+                continue
+            merged_rules.add((rule_path, rule_args))
+
+    for rule_path, rule_args in merged_rules:
+        if rule_path != item_path:
+            continue
+        if not rule_args or rule_args == item_args:
+            return True
+    return False
+
+
 def launch_group(group_key: str, show_done: bool = False) -> int:
     data = load_config()
     group = find_group(data, group_key)
@@ -145,6 +223,240 @@ def launch_group(group_key: str, show_done: bool = False) -> int:
     if show_done:
         messagebox.showinfo(APP_NAME, f"已启动：{group.get('name', '')}")
     return 0
+
+
+def get_window_text(hwnd: int) -> str:
+    length = ctypes.windll.user32.GetWindowTextLengthW(hwnd)
+    if length <= 0:
+        return ""
+    buffer = ctypes.create_unicode_buffer(length + 1)
+    ctypes.windll.user32.GetWindowTextW(hwnd, buffer, length + 1)
+    return buffer.value
+
+
+def get_foreground_window_info() -> dict:
+    hwnd = ctypes.windll.user32.GetForegroundWindow()
+    if not hwnd:
+        raise RuntimeError("没有找到当前窗口。")
+
+    pid = wintypes.DWORD()
+    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    if not pid.value:
+        raise RuntimeError("没有读取到窗口进程。")
+
+    return {"hwnd": hwnd, "pid": pid.value, "title": get_window_text(hwnd)}
+
+
+def get_window_pid(hwnd: int) -> int:
+    pid = wintypes.DWORD()
+    ctypes.windll.user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return pid.value
+
+
+def get_visible_window_infos() -> list[dict]:
+    windows = []
+    own_pid = os.getpid()
+    enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+    def callback(hwnd, _lparam):
+        if not ctypes.windll.user32.IsWindowVisible(hwnd):
+            return True
+        title = get_window_text(hwnd).strip()
+        if not title:
+            return True
+        pid = get_window_pid(hwnd)
+        if not pid or pid == own_pid:
+            return True
+        windows.append({"hwnd": hwnd, "pid": pid, "title": title})
+        return True
+
+    ctypes.windll.user32.EnumWindows(enum_proc_type(callback), 0)
+    return windows
+
+
+def get_process_image_path(pid: int) -> str:
+    process_query_limited_information = 0x1000
+    handle = ctypes.windll.kernel32.OpenProcess(process_query_limited_information, False, pid)
+    if not handle:
+        return ""
+    try:
+        size = wintypes.DWORD(32768)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        ok = ctypes.windll.kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size))
+        return buffer.value if ok else ""
+    finally:
+        ctypes.windll.kernel32.CloseHandle(handle)
+
+
+def get_process_command_line(pid: int) -> str:
+    script = (
+        "$p = Get-CimInstance Win32_Process -Filter \"ProcessId="
+        + str(pid)
+        + "\"; if ($p) { $p.CommandLine }"
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        return ""
+    return result.stdout.strip()
+
+
+def get_process_command_lines(pids: list[int]) -> dict[int, str]:
+    ids = sorted({int(pid) for pid in pids if pid})
+    if not ids:
+        return {}
+
+    filter_text = " OR ".join(f"ProcessId = {pid}" for pid in ids)
+    script = (
+        'Get-CimInstance Win32_Process -Filter "'
+        + filter_text
+        + '" | Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress'
+    )
+    try:
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", script],
+            capture_output=True,
+            text=True,
+            timeout=8,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except Exception:
+        return {}
+
+    output = result.stdout.strip()
+    if not output:
+        return {}
+    try:
+        records = json.loads(output)
+    except Exception:
+        return {}
+    if isinstance(records, dict):
+        records = [records]
+
+    command_lines = {}
+    for record in records:
+        try:
+            pid = int(record.get("ProcessId"))
+        except Exception:
+            continue
+        command_lines[pid] = record.get("CommandLine") or ""
+    return command_lines
+
+
+def split_command_line(command_line: str) -> list[str]:
+    if not command_line:
+        return []
+
+    argc = ctypes.c_int()
+    ctypes.windll.shell32.CommandLineToArgvW.argtypes = [wintypes.LPCWSTR, ctypes.POINTER(ctypes.c_int)]
+    ctypes.windll.shell32.CommandLineToArgvW.restype = ctypes.POINTER(ctypes.c_wchar_p)
+    argv = ctypes.windll.shell32.CommandLineToArgvW(command_line, ctypes.byref(argc))
+    if not argv:
+        return []
+    try:
+        return [argv[i] for i in range(argc.value)]
+    finally:
+        ctypes.windll.kernel32.LocalFree(argv)
+
+
+def normalize_capture_value(value: str) -> str:
+    value = (value or "").strip().strip('"')
+    if value.lower().startswith("file:///"):
+        value = unquote(value[8:])
+        if re.match(r"^/[a-zA-Z]:/", value):
+            value = value[1:]
+        value = value.replace("/", "\\")
+    return os.path.expandvars(os.path.expanduser(value))
+
+
+def iter_capture_values(args: list[str]):
+    for arg in args:
+        if not arg:
+            continue
+        yield arg
+        if "=" in arg:
+            yield arg.split("=", 1)[1]
+
+
+def choose_captured_target(exe_path: str, command_line: str) -> tuple[str, str, str]:
+    args = split_command_line(command_line)
+    exe_resolved = str(Path(exe_path).resolve()) if exe_path else ""
+
+    for value in iter_capture_values(args[1:]):
+        candidate = normalize_capture_value(value)
+        if is_url(candidate):
+            return candidate, "", "网址"
+        if candidate and Path(candidate).exists():
+            try:
+                if exe_resolved and str(Path(candidate).resolve()).lower() == exe_resolved.lower():
+                    continue
+            except Exception:
+                pass
+            return candidate, "", "文件"
+
+    if exe_path:
+        return exe_path, "", "软件"
+    raise RuntimeError("没有识别到可启动的文件或软件。")
+
+
+def capture_window_launch_item(info: dict, command_line: str | None = None) -> tuple[dict, str]:
+    exe_path = get_process_image_path(info["pid"])
+    command_line = command_line if command_line is not None else get_process_command_line(info["pid"])
+    target, args, target_type = choose_captured_target(exe_path, command_line)
+    item = {"path": target, "args": args, "enabled": True}
+    title = info.get("title") or Path(target).name or target
+    return item, f"{target_type}：{title}"
+
+
+def should_skip_capture_item(item: dict) -> bool:
+    path = item.get("path", "")
+    if Path(path).name.lower() == "explorer.exe" and not item.get("args", "").strip():
+        return True
+    return False
+
+
+def capture_foreground_launch_item() -> tuple[dict, str]:
+    info = get_foreground_window_info()
+    if info["pid"] == os.getpid():
+        raise RuntimeError("捕捉到的是一键启动窗口，请点捕捉后切换到目标软件。")
+
+    item, status = capture_window_launch_item(info)
+    return item, f"已捕捉{status}"
+
+
+def capture_all_visible_launch_items() -> tuple[list[dict], list[str]]:
+    windows = get_visible_window_infos()
+    if not windows:
+        raise RuntimeError("没有找到可捕捉的窗口。")
+
+    command_lines = get_process_command_lines([window["pid"] for window in windows])
+    items = []
+    statuses = []
+    seen = set()
+
+    for window in windows:
+        try:
+            item, status = capture_window_launch_item(window, command_lines.get(window["pid"], ""))
+        except Exception:
+            continue
+        if should_skip_capture_item(item):
+            continue
+        key = (item.get("path", "").lower(), item.get("args", "").lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        items.append(item)
+        statuses.append(status)
+
+    if not items:
+        raise RuntimeError("没有识别到可启动的文件或软件。")
+    return items, statuses
 
 
 def get_desktop_dir() -> Path:
@@ -297,15 +609,17 @@ def create_shortcut(shortcut_path: Path, target: str, args: str, workdir: str, d
 class LauncherApp:
     def __init__(self, root: Tk):
         self.root = root
-        self.root.title(APP_NAME)
+        self.root.title(f"{APP_NAME} {APP_VERSION}")
         self.root.geometry("860x520")
-        self.root.minsize(760, 460)
+        self.root.minsize(700, 460)
         self.data = load_config()
         self.selected_group_id = None
+        self.selected_rule_group_id = None
         self.status = StringVar(value="配置已自动保存在本机。")
 
         self.build_ui()
         self.refresh_groups()
+        self.refresh_rule_groups()
 
     def setup_style(self) -> None:
         style = ttk.Style(self.root)
@@ -325,12 +639,21 @@ class LauncherApp:
         self.root.option_add("*Font", "{Microsoft YaHei UI} 10")
         self.setup_style()
 
-        main = ttk.Frame(self.root, padding=14)
-        main.pack(fill=BOTH, expand=True)
+        self.notebook = ttk.Notebook(self.root)
+        self.notebook.pack(fill=BOTH, expand=True)
+        launch_tab = ttk.Frame(self.notebook)
+        rules_tab = ttk.Frame(self.notebook)
+        self.notebook.add(launch_tab, text="启动工作组")
+        self.notebook.add(rules_tab, text="捕捉规则")
 
-        left = ttk.Frame(main, width=240)
-        left.pack(side=LEFT, fill=Y)
-        left.pack_propagate(False)
+        main = ttk.Frame(launch_tab, padding=14)
+        main.pack(fill=BOTH, expand=True)
+        main.columnconfigure(0, weight=0, minsize=210)
+        main.columnconfigure(1, weight=1)
+        main.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(main)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
 
         ttk.Label(left, text="工作组", anchor=W, style="Section.TLabel").pack(fill=X)
         group_wrap = ttk.Frame(left)
@@ -364,43 +687,58 @@ class LauncherApp:
         ttk.Button(left, text="创建本软件快捷方式", command=self.create_manager_shortcut).pack(fill=X, pady=2)
 
         right = ttk.Frame(main)
-        right.pack(side=RIGHT, fill=BOTH, expand=True, padx=(14, 0))
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(2, weight=1)
 
         top = ttk.Frame(right)
-        top.pack(fill=X)
-        ttk.Label(top, text="当前工作组：", style="Title.TLabel").pack(side=LEFT)
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(1, weight=1)
+        ttk.Label(top, text="当前工作组：", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         self.group_name = StringVar(value="未选择")
-        ttk.Label(top, textvariable=self.group_name, anchor=W).pack(side=LEFT, fill=X, expand=True)
-        ttk.Button(top, text="运行", command=self.run_selected_group, style="Primary.TButton").pack(side=RIGHT, padx=(8, 0))
-        ttk.Button(top, text="创建桌面快捷方式", command=self.create_group_shortcut).pack(side=RIGHT)
+        ttk.Label(top, textvariable=self.group_name, anchor=W).grid(row=0, column=1, sticky="ew")
+        ttk.Button(top, text="创建桌面快捷方式", command=self.create_group_shortcut).grid(row=0, column=2, sticky="e", padx=(8, 0))
+        ttk.Button(top, text="运行", command=self.run_selected_group, style="Primary.TButton").grid(row=0, column=3, sticky="e", padx=(8, 0))
 
-        ttk.Label(right, text="启动项目", anchor=W, style="Section.TLabel").pack(fill=X, pady=(14, 0))
+        ttk.Label(right, text="启动项目", anchor=W, style="Section.TLabel").grid(row=1, column=0, sticky="ew", pady=(14, 0))
         item_wrap = ttk.Frame(right)
-        item_wrap.pack(fill=BOTH, expand=True, pady=(6, 8))
+        item_wrap.grid(row=2, column=0, sticky="nsew", pady=(6, 8))
+        item_wrap.columnconfigure(0, weight=1)
+        item_wrap.rowconfigure(0, weight=1)
         item_scroll = ttk.Scrollbar(item_wrap, orient=VERTICAL)
         self.item_tree = ttk.Treeview(
             item_wrap,
-            columns=("name", "path"),
+            columns=("delete", "name", "path"),
             show="headings",
             selectmode="browse",
         )
+        self.item_tree.heading("delete", text="操作")
         self.item_tree.heading("name", text="名称")
         self.item_tree.heading("path", text="路径 / 参数")
-        self.item_tree.column("name", width=210, minwidth=130, stretch=False, anchor=W)
+        self.item_tree.column("delete", width=68, minwidth=58, stretch=False, anchor="center")
+        self.item_tree.column("name", width=210, minwidth=110, stretch=True, anchor=W)
         self.item_tree.column("path", width=470, minwidth=220, stretch=True, anchor=W)
-        self.item_tree.pack(side=LEFT, fill=BOTH, expand=True)
-        item_scroll.pack(side=RIGHT, fill=Y)
+        self.item_tree.grid(row=0, column=0, sticky="nsew")
+        item_scroll.grid(row=0, column=1, sticky="ns")
         self.item_tree.config(yscrollcommand=item_scroll.set)
         item_scroll.config(command=self.item_tree.yview)
-        self.item_tree.bind("<Double-Button-1>", lambda _event: self.run_selected_item())
+        self.item_tree.bind("<Button-1>", self.on_item_tree_press)
+        self.item_tree.bind("<ButtonRelease-1>", self.on_item_tree_release)
+        self.item_tree.bind("<Double-Button-1>", self.on_item_tree_double_click)
+        self.item_tree.bind("<Configure>", self.resize_item_columns)
 
         buttons = ttk.Frame(right)
-        buttons.pack(fill=X)
-        ttk.Button(buttons, text="添加文件/软件", command=self.add_files).pack(side=LEFT, padx=(0, 6))
-        ttk.Button(buttons, text="添加文件夹", command=self.add_folder).pack(side=LEFT, padx=6)
-        ttk.Button(buttons, text="添加路径/网址", command=self.add_path).pack(side=LEFT, padx=6)
-        ttk.Button(buttons, text="设置参数", command=self.set_args).pack(side=LEFT, padx=6)
-        ttk.Button(buttons, text="删除项目", command=self.delete_item).pack(side=LEFT, padx=6)
+        buttons.grid(row=3, column=0, sticky="ew")
+        for column in range(3):
+            buttons.columnconfigure(column, weight=1, uniform="actions")
+        ttk.Button(buttons, text="添加文件/软件", command=self.add_files).grid(row=0, column=0, sticky="ew", padx=(0, 4), pady=(0, 6))
+        ttk.Button(buttons, text="添加文件夹", command=self.add_folder).grid(row=0, column=1, sticky="ew", padx=4, pady=(0, 6))
+        ttk.Button(buttons, text="添加路径/网址", command=self.add_path).grid(row=0, column=2, sticky="ew", padx=(4, 0), pady=(0, 6))
+        ttk.Button(buttons, text="设置参数", command=self.set_args).grid(row=1, column=0, sticky="ew", padx=(0, 4))
+        self.capture_button = ttk.Button(buttons, text="捕捉当前窗口", command=self.capture_current_window)
+        self.capture_button.grid(row=1, column=1, sticky="ew", padx=4)
+        self.capture_all_button = ttk.Button(buttons, text="捕捉全部窗口", command=self.capture_all_windows)
+        self.capture_all_button.grid(row=1, column=2, sticky="ew", padx=(4, 0))
 
         status = ttk.Label(self.root, textvariable=self.status, anchor=W, relief="sunken", style="Status.TLabel")
         status.pack(fill=X, side="bottom")
@@ -411,11 +749,112 @@ class LauncherApp:
         menu.add_cascade(label="操作", menu=app_menu)
         app_menu.add_command(label="创建一键启动桌面快捷方式", command=self.create_manager_shortcut)
         app_menu.add_command(label="打开程序目录", command=lambda: os.startfile(str(app_dir())))
+        app_menu.add_command(label="关于", command=self.show_about)
+
+        self.build_rules_ui(rules_tab)
+
+    def build_rules_ui(self, parent) -> None:
+        main = ttk.Frame(parent, padding=14)
+        main.pack(fill=BOTH, expand=True)
+        main.columnconfigure(0, weight=0, minsize=210)
+        main.columnconfigure(1, weight=1)
+        main.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(main)
+        left.grid(row=0, column=0, sticky="nsew", padx=(0, 14))
+
+        ttk.Label(left, text="规则组", anchor=W, style="Section.TLabel").pack(fill=X)
+        rule_group_wrap = ttk.Frame(left)
+        rule_group_wrap.pack(fill=BOTH, expand=True, pady=(6, 8))
+        rule_group_scroll = ttk.Scrollbar(rule_group_wrap, orient=VERTICAL)
+        self.rule_group_list = Listbox(
+            rule_group_wrap,
+            exportselection=False,
+            activestyle="dotbox",
+            selectmode=SINGLE,
+            borderwidth=0,
+            highlightthickness=1,
+            highlightbackground="#d7dce5",
+            highlightcolor="#8aa4d6",
+            relief="flat",
+            bg="#ffffff",
+            selectbackground="#2563eb",
+            selectforeground="#ffffff",
+            font=("Microsoft YaHei UI", 10),
+        )
+        self.rule_group_list.pack(side=LEFT, fill=BOTH, expand=True)
+        rule_group_scroll.pack(side=RIGHT, fill=Y)
+        self.rule_group_list.config(yscrollcommand=rule_group_scroll.set)
+        rule_group_scroll.config(command=self.rule_group_list.yview)
+        self.rule_group_list.bind("<<ListboxSelect>>", self.on_rule_group_select)
+
+        ttk.Button(left, text="新建", command=self.add_rule_group).pack(fill=X, pady=2)
+        ttk.Button(left, text="重命名", command=self.rename_rule_group).pack(fill=X, pady=2)
+        ttk.Button(left, text="删除", command=self.delete_rule_group).pack(fill=X, pady=2)
+        ttk.Separator(left).pack(fill=X, pady=10)
+        ttk.Button(left, text="启用当前规则组", command=self.enable_current_rule_group).pack(fill=X, pady=2)
+        ttk.Button(left, text="停用当前规则组", command=self.disable_rule_group).pack(fill=X, pady=2)
+        ttk.Button(left, text="停用全部规则组", command=self.disable_all_rule_groups).pack(fill=X, pady=2)
+
+        right = ttk.Frame(main)
+        right.grid(row=0, column=1, sticky="nsew")
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(2, weight=1)
+
+        top = ttk.Frame(right)
+        top.grid(row=0, column=0, sticky="ew")
+        top.columnconfigure(1, weight=1)
+        ttk.Label(top, text="当前规则组：", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        self.rule_group_name = StringVar(value="未选择")
+        ttk.Label(top, textvariable=self.rule_group_name, anchor=W).grid(row=0, column=1, sticky="ew")
+        self.active_rule_name = StringVar(value="启用规则组：无")
+        ttk.Label(top, textvariable=self.active_rule_name, anchor=W).grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+
+        ttk.Label(right, text="不会被捕捉的路径", anchor=W, style="Section.TLabel").grid(row=1, column=0, sticky="ew", pady=(14, 0))
+        rule_wrap = ttk.Frame(right)
+        rule_wrap.grid(row=2, column=0, sticky="nsew", pady=(6, 8))
+        rule_wrap.columnconfigure(0, weight=1)
+        rule_wrap.rowconfigure(0, weight=1)
+        rule_scroll = ttk.Scrollbar(rule_wrap, orient=VERTICAL)
+        self.rule_tree = ttk.Treeview(
+            rule_wrap,
+            columns=("delete", "name", "path"),
+            show="headings",
+            selectmode="browse",
+        )
+        self.rule_tree.heading("delete", text="操作")
+        self.rule_tree.heading("name", text="名称")
+        self.rule_tree.heading("path", text="路径 / 参数")
+        self.rule_tree.column("delete", width=68, minwidth=58, stretch=False, anchor="center")
+        self.rule_tree.column("name", width=210, minwidth=110, stretch=True, anchor=W)
+        self.rule_tree.column("path", width=470, minwidth=220, stretch=True, anchor=W)
+        self.rule_tree.grid(row=0, column=0, sticky="nsew")
+        rule_scroll.grid(row=0, column=1, sticky="ns")
+        self.rule_tree.config(yscrollcommand=rule_scroll.set)
+        rule_scroll.config(command=self.rule_tree.yview)
+        self.rule_tree.bind("<Button-1>", self.on_rule_tree_press)
+        self.rule_tree.bind("<ButtonRelease-1>", self.on_rule_tree_release)
+        self.rule_tree.bind("<Configure>", self.resize_rule_columns)
+
+        buttons = ttk.Frame(right)
+        buttons.grid(row=3, column=0, sticky="ew")
+        for column in range(3):
+            buttons.columnconfigure(column, weight=1, uniform="rule_actions")
+        ttk.Button(buttons, text="添加路径/网址", command=self.add_rule_path).grid(row=0, column=0, sticky="ew", padx=(0, 4))
+        self.capture_rule_button = ttk.Button(buttons, text="捕捉当前窗口", command=self.capture_current_rule)
+        self.capture_rule_button.grid(row=0, column=1, sticky="ew", padx=4)
+        self.capture_all_rules_button = ttk.Button(buttons, text="捕捉全部窗口", command=self.capture_all_rules)
+        self.capture_all_rules_button.grid(row=0, column=2, sticky="ew", padx=(4, 0))
 
     def current_group(self) -> dict | None:
         if not self.selected_group_id:
             return None
         return find_group(self.data, self.selected_group_id)
+
+    def current_rule_group(self) -> dict | None:
+        if not self.selected_rule_group_id:
+            return None
+        return find_rule_group(self.data, self.selected_rule_group_id)
 
     def selected_index(self, listbox: Listbox) -> int | None:
         selection = listbox.curselection()
@@ -445,6 +884,135 @@ class LauncherApp:
         self.group_name.set(groups[index].get("name", "未命名工作组"))
         self.refresh_items()
 
+    def refresh_rule_groups(self) -> None:
+        if not hasattr(self, "rule_group_list"):
+            return
+        self.rule_group_list.delete(0, END)
+        groups = self.data.get("rule_groups", [])
+        active_ids = set(active_rule_group_ids(self.data))
+        for group in groups:
+            name = group.get("name", "未命名规则组")
+            if group.get("id") in active_ids:
+                name += "  [启用]"
+            self.rule_group_list.insert(END, name)
+
+        names = active_rule_names(self.data)
+        self.active_rule_name.set(f"启用规则组：{', '.join(names)}" if names else "启用规则组：无")
+
+        if not groups:
+            self.selected_rule_group_id = None
+            self.rule_group_name.set("未选择")
+            self.refresh_rules()
+            return
+
+        index = 0
+        for i, group in enumerate(groups):
+            if group.get("id") == self.selected_rule_group_id:
+                index = i
+                break
+        self.rule_group_list.selection_clear(0, END)
+        self.rule_group_list.selection_set(index)
+        self.rule_group_list.activate(index)
+        self.selected_rule_group_id = groups[index].get("id")
+        self.rule_group_name.set(groups[index].get("name", "未命名规则组"))
+        self.refresh_rules()
+
+    def refresh_rules(self) -> None:
+        if not hasattr(self, "rule_tree"):
+            return
+        for row in self.rule_tree.get_children():
+            self.rule_tree.delete(row)
+        group = self.current_rule_group()
+        if not group:
+            return
+        for index, rule in enumerate(group.get("rules", [])):
+            path = rule.get("path", "")
+            args = rule.get("args", "").strip()
+            name = Path(path).name or path or "未命名规则"
+            path_text = path
+            if args:
+                path_text += f"    参数：{args}"
+            self.rule_tree.insert("", END, iid=str(index), values=("❌", name, path_text))
+
+    def on_rule_group_select(self, _event=None) -> None:
+        index = self.selected_index(self.rule_group_list)
+        if index is None:
+            return
+        groups = self.data.get("rule_groups", [])
+        if index >= len(groups):
+            return
+        group = groups[index]
+        self.selected_rule_group_id = group.get("id")
+        self.rule_group_name.set(group.get("name", "未命名规则组"))
+        self.refresh_rules()
+
+    def add_rule_group(self) -> None:
+        name = simpledialog.askstring(APP_NAME, "规则组名称：", parent=self.root)
+        if not name:
+            return
+        group = {"id": uuid.uuid4().hex, "name": name.strip(), "rules": []}
+        self.data.setdefault("rule_groups", []).append(group)
+        self.selected_rule_group_id = group["id"]
+        save_config(self.data)
+        self.refresh_rule_groups()
+        self.status.set(f"已新建规则组：{group['name']}")
+
+    def rename_rule_group(self) -> None:
+        group = self.current_rule_group()
+        if not group:
+            messagebox.showinfo(APP_NAME, "请先选择一个规则组。")
+            return
+        name = simpledialog.askstring(APP_NAME, "新的规则组名称：", initialvalue=group.get("name", ""), parent=self.root)
+        if not name:
+            return
+        group["name"] = name.strip()
+        save_config(self.data)
+        self.refresh_rule_groups()
+        self.status.set("已重命名规则组。")
+
+    def delete_rule_group(self) -> None:
+        group = self.current_rule_group()
+        if not group:
+            return
+        if not messagebox.askyesno(APP_NAME, f"删除规则组“{group.get('name', '')}”？"):
+            return
+        active_ids = [group_id for group_id in active_rule_group_ids(self.data) if group_id != group.get("id")]
+        self.data["active_rule_group_ids"] = active_ids
+        self.data["rule_groups"] = [g for g in self.data.get("rule_groups", []) if g.get("id") != group.get("id")]
+        self.selected_rule_group_id = None
+        save_config(self.data)
+        self.refresh_rule_groups()
+        self.status.set("已删除规则组。")
+
+    def enable_current_rule_group(self) -> None:
+        group = self.current_rule_group()
+        if not group:
+            messagebox.showinfo(APP_NAME, "请先选择一个规则组。")
+            return
+        active_ids = active_rule_group_ids(self.data)
+        if group.get("id") not in active_ids:
+            active_ids.append(group.get("id"))
+        self.data["active_rule_group_ids"] = active_ids
+        save_config(self.data)
+        self.refresh_rule_groups()
+        self.status.set(f"已启用规则组：{group.get('name', '')}")
+
+    def disable_rule_group(self) -> None:
+        group = self.current_rule_group()
+        if not group:
+            messagebox.showinfo(APP_NAME, "请先选择一个规则组。")
+            return
+        self.data["active_rule_group_ids"] = [group_id for group_id in active_rule_group_ids(self.data) if group_id != group.get("id")]
+        save_config(self.data)
+        self.refresh_rule_groups()
+        self.status.set(f"已停用规则组：{group.get('name', '')}")
+
+    def disable_all_rule_groups(self) -> None:
+        self.data["active_rule_group_ids"] = []
+        save_config(self.data)
+        self.refresh_rule_groups()
+        self.status.set("已停用全部捕捉规则。")
+
     def refresh_items(self) -> None:
         for row in self.item_tree.get_children():
             self.item_tree.delete(row)
@@ -458,7 +1026,76 @@ class LauncherApp:
             path_text = path
             if args:
                 path_text += f"    参数：{args}"
-            self.item_tree.insert("", END, iid=str(index), values=(name, path_text))
+            self.item_tree.insert("", END, iid=str(index), values=("❌", name, path_text))
+
+    def on_item_tree_press(self, event) -> str | None:
+        if self.item_tree.identify_column(event.x) != "#1":
+            return None
+        return "break"
+
+    def on_item_tree_release(self, event) -> str | None:
+        if self.item_tree.identify_column(event.x) != "#1":
+            return None
+        return self.delete_item_from_event(event)
+
+    def on_item_tree_double_click(self, event) -> str | None:
+        if self.item_tree.identify_column(event.x) == "#1":
+            return "break"
+        self.run_selected_item()
+        return "break"
+
+    def delete_item_from_event(self, event) -> str | None:
+        row_id = self.item_tree.identify_row(event.y)
+        if not row_id:
+            return "break"
+        try:
+            index = int(row_id)
+        except ValueError:
+            return None
+        self.delete_item_at_index(index)
+        self.root.update_idletasks()
+        self.item_tree.event_generate("<Motion>")
+        return "break"
+
+    def resize_item_columns(self, _event=None) -> None:
+        total_width = max(self.item_tree.winfo_width(), 360)
+        delete_width = 68
+        available = max(total_width - delete_width - 24, 260)
+        name_width = max(120, min(260, int(available * 0.32)))
+        path_width = max(180, available - name_width)
+        self.item_tree.column("delete", width=delete_width)
+        self.item_tree.column("name", width=name_width)
+        self.item_tree.column("path", width=path_width)
+
+    def on_rule_tree_press(self, event) -> str | None:
+        if self.rule_tree.identify_column(event.x) != "#1":
+            return None
+        return "break"
+
+    def on_rule_tree_release(self, event) -> str | None:
+        if self.rule_tree.identify_column(event.x) != "#1":
+            return None
+        row_id = self.rule_tree.identify_row(event.y)
+        if not row_id:
+            return "break"
+        try:
+            index = int(row_id)
+        except ValueError:
+            return None
+        self.delete_rule_at_index(index)
+        self.root.update_idletasks()
+        self.rule_tree.event_generate("<Motion>")
+        return "break"
+
+    def resize_rule_columns(self, _event=None) -> None:
+        total_width = max(self.rule_tree.winfo_width(), 360)
+        delete_width = 68
+        available = max(total_width - delete_width - 24, 260)
+        name_width = max(120, min(260, int(available * 0.32)))
+        path_width = max(180, available - name_width)
+        self.rule_tree.column("delete", width=delete_width)
+        self.rule_tree.column("name", width=name_width)
+        self.rule_tree.column("path", width=path_width)
 
     def on_group_select(self, _event=None) -> None:
         index = self.selected_index(self.group_list)
@@ -514,6 +1151,12 @@ class LauncherApp:
             messagebox.showinfo(APP_NAME, "请先新建或选择一个工作组。")
         return group
 
+    def require_rule_group(self) -> dict | None:
+        group = self.current_rule_group()
+        if not group:
+            messagebox.showinfo(APP_NAME, "请先新建或选择一个规则组。")
+        return group
+
     def add_files(self) -> None:
         group = self.require_group()
         if not group:
@@ -550,6 +1193,197 @@ class LauncherApp:
         self.refresh_items()
         self.status.set("已添加路径。")
 
+    def add_rule_path(self) -> None:
+        group = self.require_rule_group()
+        if not group:
+            return
+        path = simpledialog.askstring(APP_NAME, "输入不希望被捕捉的文件、软件、文件夹路径，或网址：", parent=self.root)
+        if not path:
+            return
+        self.add_rules_to_group(group.get("id"), [{"path": path.strip(), "args": "", "enabled": True}])
+
+    def add_rules_to_group(self, group_id: str, rules: list[dict]) -> int:
+        group = find_rule_group(self.data, group_id)
+        if not group:
+            return 0
+        existing = {
+            (normalize_rule_path(rule.get("path", "")), (rule.get("args", "") or "").strip())
+            for rule in group.get("rules", [])
+        }
+        added = 0
+        for rule in rules:
+            key = (normalize_rule_path(rule.get("path", "")), (rule.get("args", "") or "").strip())
+            if not key[0] or key in existing:
+                continue
+            group.setdefault("rules", []).append(
+                {
+                    "path": rule.get("path", ""),
+                    "args": rule.get("args", ""),
+                    "enabled": rule.get("enabled", True),
+                }
+            )
+            existing.add(key)
+            added += 1
+        if added:
+            self.selected_rule_group_id = group_id
+            save_config(self.data)
+            self.refresh_rule_groups()
+        return added
+
+    def capture_current_rule(self) -> None:
+        group = self.require_rule_group()
+        if not group:
+            return
+        group_id = group.get("id")
+        self.set_capture_buttons_state("disabled")
+        self.status.set("3 秒内切换到要作为规则的窗口。")
+        self.root.after(3000, lambda: self.start_rule_capture_worker(group_id))
+
+    def capture_all_rules(self) -> None:
+        group = self.require_rule_group()
+        if not group:
+            return
+        group_id = group.get("id")
+        self.set_capture_buttons_state("disabled")
+        self.status.set("正在捕捉当前桌面上的可见窗口作为规则...")
+        thread = threading.Thread(target=self.capture_all_rules_worker, args=(group_id,), daemon=True)
+        thread.start()
+
+    def start_rule_capture_worker(self, group_id: str) -> None:
+        thread = threading.Thread(target=self.capture_rule_worker, args=(group_id,), daemon=True)
+        thread.start()
+
+    def capture_rule_worker(self, group_id: str) -> None:
+        try:
+            item, status = capture_foreground_launch_item()
+        except Exception as exc:
+            self.root.after(0, lambda: self.finish_rule_capture(group_id, [], str(exc)))
+            return
+        self.root.after(0, lambda: self.finish_rule_capture(group_id, [item], status))
+
+    def capture_all_rules_worker(self, group_id: str) -> None:
+        try:
+            items, statuses = capture_all_visible_launch_items()
+        except Exception as exc:
+            self.root.after(0, lambda: self.finish_rule_capture(group_id, [], str(exc)))
+            return
+        self.root.after(0, lambda: self.finish_rule_capture(group_id, items, f"已捕捉 {len(items)} 条规则候选。"))
+
+    def finish_rule_capture(self, group_id: str, rules: list[dict], status: str) -> None:
+        self.set_capture_buttons_state("normal")
+        if not rules:
+            self.status.set("规则捕捉失败。")
+            messagebox.showwarning(APP_NAME, status)
+            return
+        added = self.add_rules_to_group(group_id, rules)
+        self.status.set(f"已添加 {added} 条捕捉规则。" if added else "没有新增规则，可能已存在。")
+
+    def delete_rule_at_index(self, index: int) -> None:
+        group = self.current_rule_group()
+        if not group:
+            return
+        rules = group.get("rules", [])
+        if index < 0 or index >= len(rules):
+            return
+        del rules[index]
+        save_config(self.data)
+        self.refresh_rules()
+        self.status.set("已删除规则。")
+
+    def capture_current_window(self) -> None:
+        group = self.require_group()
+        if not group:
+            return
+        group_id = group.get("id")
+        self.set_capture_buttons_state("disabled")
+        self.status.set("3 秒内切换到要捕捉的窗口，一键启动会优先保存它正在打开的文件。")
+        self.root.after(3000, lambda: self.start_capture_worker(group_id))
+
+    def capture_all_windows(self) -> None:
+        group = self.require_group()
+        if not group:
+            return
+        group_id = group.get("id")
+        self.set_capture_buttons_state("disabled")
+        self.status.set("正在捕捉当前桌面上的可见窗口...")
+        thread = threading.Thread(target=self.capture_all_worker, args=(group_id,), daemon=True)
+        thread.start()
+
+    def set_capture_buttons_state(self, state: str) -> None:
+        self.capture_button.config(state=state)
+        self.capture_all_button.config(state=state)
+        if hasattr(self, "capture_rule_button"):
+            self.capture_rule_button.config(state=state)
+        if hasattr(self, "capture_all_rules_button"):
+            self.capture_all_rules_button.config(state=state)
+
+    def start_capture_worker(self, group_id: str) -> None:
+        thread = threading.Thread(target=self.capture_worker, args=(group_id,), daemon=True)
+        thread.start()
+
+    def capture_worker(self, group_id: str) -> None:
+        try:
+            item, status = capture_foreground_launch_item()
+        except Exception as exc:
+            self.root.after(0, lambda: self.finish_capture(group_id, None, str(exc)))
+            return
+        self.root.after(0, lambda: self.finish_capture(group_id, item, status))
+
+    def capture_all_worker(self, group_id: str) -> None:
+        try:
+            items, statuses = capture_all_visible_launch_items()
+        except Exception as exc:
+            self.root.after(0, lambda: self.finish_capture_all(group_id, [], str(exc)))
+            return
+        self.root.after(0, lambda: self.finish_capture_all(group_id, items, statuses))
+
+    def finish_capture(self, group_id: str, item: dict | None, status: str) -> None:
+        self.set_capture_buttons_state("normal")
+        if not item:
+            self.status.set("捕捉失败。")
+            messagebox.showwarning(APP_NAME, status)
+            return
+
+        group = find_group(self.data, group_id)
+        if not group:
+            self.status.set("捕捉成功，但原工作组不存在。")
+            return
+
+        if item_blocked_by_active_rules(self.data, item):
+            self.status.set("已按启用规则组跳过该捕捉项目。")
+            return
+
+        group.setdefault("items", []).append(item)
+        self.selected_group_id = group_id
+        save_config(self.data)
+        self.refresh_groups()
+        self.status.set(status)
+
+    def finish_capture_all(self, group_id: str, items: list[dict], status) -> None:
+        self.set_capture_buttons_state("normal")
+        if not items:
+            self.status.set("捕捉失败。")
+            messagebox.showwarning(APP_NAME, str(status))
+            return
+
+        group = find_group(self.data, group_id)
+        if not group:
+            self.status.set("捕捉成功，但原工作组不存在。")
+            return
+
+        allowed_items = [item for item in items if not item_blocked_by_active_rules(self.data, item)]
+        skipped = len(items) - len(allowed_items)
+        if not allowed_items:
+            self.status.set(f"已按启用规则组跳过 {skipped} 个捕捉项目。")
+            return
+
+        group.setdefault("items", []).extend(allowed_items)
+        self.selected_group_id = group_id
+        save_config(self.data)
+        self.refresh_groups()
+        suffix = f"，跳过 {skipped} 个" if skipped else ""
+        self.status.set(f"已捕捉 {len(allowed_items)} 个窗口项目{suffix}，可按需删除多余项。")
+
     def selected_item(self) -> tuple[dict, int] | tuple[None, None]:
         group = self.current_group()
         selection = self.item_tree.selection()
@@ -581,6 +1415,15 @@ class LauncherApp:
         group = self.current_group()
         item, index = self.selected_item()
         if not group or item is None or index is None:
+            return
+        self.delete_item_at_index(index)
+
+    def delete_item_at_index(self, index: int) -> None:
+        group = self.current_group()
+        if not group:
+            return
+        items = group.get("items", [])
+        if index < 0 or index >= len(items):
             return
         del group["items"][index]
         save_config(self.data)
@@ -652,9 +1495,12 @@ class LauncherApp:
             return
         self.status.set(f"已创建桌面快捷方式：{shortcut.name}")
 
+    def show_about(self) -> None:
+        messagebox.showinfo(APP_NAME, f"{APP_NAME}\n版本：{APP_VERSION}")
+
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=APP_NAME)
+    parser = argparse.ArgumentParser(description=f"{APP_NAME} {APP_VERSION}")
     parser.add_argument("--run", help="直接启动指定工作组 ID 或名称")
     return parser.parse_args()
 
