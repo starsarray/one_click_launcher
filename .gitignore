@@ -1,6 +1,0 @@
-__pycache__/
-build/
-*.spec
-launcher_config.json
-dist/launcher_config.json
-dist/一键启动-v0.4.0-demo.exe
