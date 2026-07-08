@@ -37,8 +37,17 @@ from tkinter import (
 
 
 APP_NAME = "一键启动"
-APP_VERSION = "v0.4.1-demo"
+APP_VERSION = "v0.4.12-demo"
 CONFIG_FILE = "launcher_config.json"
+OFFICE_CAPTURE_SPECS = (
+    ({"wps", "kwps", "et", "ket", "wpp", "kwpp"}, "KWPS.Application", "Documents"),
+    ({"wps", "kwps", "et", "ket", "wpp", "kwpp"}, "KET.Application", "Workbooks"),
+    ({"wps", "kwps", "et", "ket", "wpp", "kwpp"}, "KWPP.Application", "Presentations"),
+    ({"wps", "kwps", "et", "ket", "wpp", "kwpp", "wpspdf", "kpdf"}, "KPDF.Application", "Documents"),
+    ({"winword"}, "Word.Application", "Documents"),
+    ({"excel"}, "Excel.Application", "Workbooks"),
+    ({"powerpnt"}, "PowerPoint.Application", "Presentations"),
+)
 
 
 def default_config() -> dict:
@@ -77,6 +86,45 @@ def app_entry_path() -> Path:
 
 def config_path() -> Path:
     return app_dir() / CONFIG_FILE
+
+
+def shortcut_trash_dir() -> Path:
+    path = app_dir() / ".shortcut_trash"
+    path.mkdir(exist_ok=True)
+    return path
+
+
+def notify_shell_path(path: Path, event: int) -> None:
+    ctypes.windll.shell32.SHChangeNotify(event, 0x2005, str(path), None)
+    refresh_desktop_view()
+
+
+def refresh_desktop_view() -> None:
+    try:
+        ctypes.windll.shell32.SHChangeNotify(0x00001000, 0x2005, str(get_desktop_dir()), None)
+        user32 = ctypes.windll.user32
+        handles = []
+
+        def add_desktop_list(hwnd):
+            shell = user32.FindWindowExW(hwnd, 0, "SHELLDLL_DefView", None)
+            if shell:
+                listview = user32.FindWindowExW(shell, 0, "SysListView32", None)
+                if listview:
+                    handles.append(listview)
+
+        add_desktop_list(user32.FindWindowW("Progman", None))
+        worker = 0
+        while True:
+            worker = user32.FindWindowExW(0, worker, "WorkerW", None)
+            if not worker:
+                break
+            add_desktop_list(worker)
+        for hwnd in handles:
+            user32.InvalidateRect(hwnd, None, True)
+            user32.UpdateWindow(hwnd)
+            user32.PostMessageW(hwnd, 0x0111, 28931, 0)
+    except Exception:
+        pass
 
 
 def load_config() -> dict:
@@ -405,13 +453,77 @@ def choose_captured_target(exe_path: str, command_line: str) -> tuple[str, str, 
     raise RuntimeError("没有识别到可启动的文件或软件。")
 
 
-def capture_window_launch_item(info: dict, command_line: str | None = None) -> tuple[dict, str]:
+def iter_com_items(collection):
+    try:
+        count = int(collection.Count)
+        for index in range(1, count + 1):
+            yield collection.Item(index)
+        return
+    except Exception:
+        pass
+
+    try:
+        yield from collection
+    except Exception:
+        return
+
+
+def get_open_office_document_paths(exe_path: str) -> list[str]:
+    exe_name = Path(exe_path).stem.lower() if exe_path else ""
+    specs = [spec for spec in OFFICE_CAPTURE_SPECS if exe_name in spec[0]]
+    if not specs:
+        return []
+
+    try:
+        import pythoncom
+        import win32com.client
+    except Exception:
+        return []
+
+    paths = []
+    seen = set()
+    pythoncom.CoInitialize()
+    try:
+        for _names, prog_id, collection_name in specs:
+            try:
+                app = win32com.client.GetActiveObject(prog_id)
+                collection = getattr(app, collection_name)
+            except Exception:
+                continue
+            for document in iter_com_items(collection):
+                try:
+                    path = str(document.FullName)
+                except Exception:
+                    continue
+                if not path or not Path(path).exists():
+                    continue
+                key = str(Path(path).resolve()).lower()
+                if key in seen:
+                    continue
+                seen.add(key)
+                paths.append(path)
+    finally:
+        pythoncom.CoUninitialize()
+    return paths
+
+
+def capture_window_launch_items(info: dict, command_line: str | None = None) -> tuple[list[dict], list[str]]:
     exe_path = get_process_image_path(info["pid"])
+    office_paths = get_open_office_document_paths(exe_path)
+    if office_paths:
+        items = [{"path": path, "args": "", "enabled": True} for path in office_paths]
+        return items, [f"文件：{Path(path).name}" for path in office_paths]
+
     command_line = command_line if command_line is not None else get_process_command_line(info["pid"])
     target, args, target_type = choose_captured_target(exe_path, command_line)
     item = {"path": target, "args": args, "enabled": True}
     title = info.get("title") or Path(target).name or target
-    return item, f"{target_type}：{title}"
+    return [item], [f"{target_type}：{title}"]
+
+
+def capture_window_launch_item(info: dict, command_line: str | None = None) -> tuple[dict, str]:
+    items, statuses = capture_window_launch_items(info, command_line)
+    return items[0], statuses[0]
 
 
 def should_skip_capture_item(item: dict) -> bool:
@@ -422,12 +534,17 @@ def should_skip_capture_item(item: dict) -> bool:
 
 
 def capture_foreground_launch_item() -> tuple[dict, str]:
+    items, statuses = capture_foreground_launch_items()
+    return items[0], statuses[0]
+
+
+def capture_foreground_launch_items() -> tuple[list[dict], list[str]]:
     info = get_foreground_window_info()
     if info["pid"] == os.getpid():
         raise RuntimeError("捕捉到的是一键启动窗口，请点捕捉后切换到目标软件。")
 
-    item, status = capture_window_launch_item(info)
-    return item, f"已捕捉{status}"
+    items, statuses = capture_window_launch_items(info)
+    return items, [f"已捕捉{status}" for status in statuses]
 
 
 def capture_all_visible_launch_items() -> tuple[list[dict], list[str]]:
@@ -442,17 +559,18 @@ def capture_all_visible_launch_items() -> tuple[list[dict], list[str]]:
 
     for window in windows:
         try:
-            item, status = capture_window_launch_item(window, command_lines.get(window["pid"], ""))
+            window_items, window_statuses = capture_window_launch_items(window, command_lines.get(window["pid"], ""))
         except Exception:
             continue
-        if should_skip_capture_item(item):
-            continue
-        key = (item.get("path", "").lower(), item.get("args", "").lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        items.append(item)
-        statuses.append(status)
+        for item, status in zip(window_items, window_statuses):
+            if should_skip_capture_item(item):
+                continue
+            key = (item.get("path", "").lower(), item.get("args", "").lower())
+            if key in seen:
+                continue
+            seen.add(key)
+            items.append(item)
+            statuses.append(status)
 
     if not items:
         raise RuntimeError("没有识别到可启动的文件或软件。")
@@ -1139,11 +1257,27 @@ class LauncherApp:
             return
         if not messagebox.askyesno(APP_NAME, f"删除工作组“{group.get('name', '')}”？"):
             return
+        shortcut_name = f"{safe_shortcut_name(group.get('name', '未命名工作组'))}.lnk"
+        shortcut_path = group.get("shortcut_path", "")
         self.data["groups"] = [g for g in self.data.get("groups", []) if g.get("id") != group.get("id")]
         self.selected_group_id = None
         save_config(self.data)
         self.refresh_groups()
         self.status.set("已删除工作组。")
+        threading.Thread(target=self.delete_group_shortcut_worker, args=(shortcut_path, shortcut_name), daemon=True).start()
+
+    def delete_group_shortcut_worker(self, shortcut_path: str, shortcut_name: str) -> None:
+        try:
+            shortcut = Path(shortcut_path) if shortcut_path else get_desktop_dir() / shortcut_name
+            trashed = shortcut_trash_dir() / f"{uuid.uuid4().hex}.lnk"
+            try:
+                os.replace(shortcut, trashed)
+            except FileNotFoundError:
+                return
+            notify_shell_path(shortcut, 0x00000004)
+            trashed.unlink(missing_ok=True)
+        except Exception as exc:
+            self.root.after(0, lambda: messagebox.showwarning(APP_NAME, f"快捷方式删除失败：{exc}"))
 
     def require_group(self) -> dict | None:
         group = self.current_group()
@@ -1255,11 +1389,11 @@ class LauncherApp:
 
     def capture_rule_worker(self, group_id: str) -> None:
         try:
-            item, status = capture_foreground_launch_item()
+            items, statuses = capture_foreground_launch_items()
         except Exception as exc:
             self.root.after(0, lambda: self.finish_rule_capture(group_id, [], str(exc)))
             return
-        self.root.after(0, lambda: self.finish_rule_capture(group_id, [item], status))
+        self.root.after(0, lambda: self.finish_rule_capture(group_id, items, f"已捕捉 {len(statuses)} 条规则候选。"))
 
     def capture_all_rules_worker(self, group_id: str) -> None:
         try:
@@ -1323,11 +1457,14 @@ class LauncherApp:
 
     def capture_worker(self, group_id: str) -> None:
         try:
-            item, status = capture_foreground_launch_item()
+            items, statuses = capture_foreground_launch_items()
         except Exception as exc:
             self.root.after(0, lambda: self.finish_capture(group_id, None, str(exc)))
             return
-        self.root.after(0, lambda: self.finish_capture(group_id, item, status))
+        if len(items) == 1:
+            self.root.after(0, lambda: self.finish_capture(group_id, items[0], statuses[0]))
+        else:
+            self.root.after(0, lambda: self.finish_capture_all(group_id, items, statuses))
 
     def capture_all_worker(self, group_id: str) -> None:
         try:
@@ -1475,6 +1612,9 @@ class LauncherApp:
         except Exception as exc:
             messagebox.showerror(APP_NAME, f"创建失败：{exc}")
             return
+        group["shortcut_path"] = str(shortcut)
+        save_config(self.data)
+        notify_shell_path(shortcut, 0x00000002)
         self.status.set(f"已创建桌面快捷方式：{shortcut.name}")
 
     def create_manager_shortcut(self) -> None:
@@ -1493,6 +1633,7 @@ class LauncherApp:
         except Exception as exc:
             messagebox.showerror(APP_NAME, f"创建失败：{exc}")
             return
+        notify_shell_path(shortcut, 0x00000002)
         self.status.set(f"已创建桌面快捷方式：{shortcut.name}")
 
     def show_about(self) -> None:
