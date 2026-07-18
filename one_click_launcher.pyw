@@ -7,6 +7,7 @@ import re
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from pathlib import Path
 from urllib.parse import unquote
@@ -37,7 +38,7 @@ from tkinter import (
 
 
 APP_NAME = "一键启动"
-APP_VERSION = "v0.4.12-demo"
+APP_VERSION = "v0.4.13-demo"
 CONFIG_FILE = "launcher_config.json"
 OFFICE_CAPTURE_SPECS = (
     ({"wps", "kwps", "et", "ket", "wpp", "kwpp"}, "KWPS.Application", "Documents"),
@@ -170,6 +171,7 @@ def launch_item(item: dict) -> str | None:
     if not is_url(target) and not Path(target).exists():
         return f"不存在：{target}"
 
+    before_hwnds = {window["hwnd"] for window in get_visible_window_infos()} if item.get("window") else set()
     try:
         if args:
             os.startfile(target, arguments=args)
@@ -177,7 +179,34 @@ def launch_item(item: dict) -> str | None:
             os.startfile(target)
     except Exception as exc:
         return f"{target}：{exc}"
+    if item.get("window"):
+        threading.Thread(target=restore_item_window, args=(item, before_hwnds), daemon=True).start()
     return None
+
+
+def restore_item_window(item: dict, before_hwnds: set[int] | None = None) -> None:
+    window = item.get("window") or {}
+    rect = window.get("rect") or {}
+    if not all(key in rect for key in ("x", "y", "width", "height")):
+        return
+
+    target = expand_target(item.get("path", ""))
+    target_stem = Path(target).stem.lower()
+    exe_path = os.path.normcase(window.get("exe", ""))
+    title_hint = (window.get("title") or "").lower()
+    before_hwnds = before_hwnds or set()
+
+    for _ in range(40):
+        windows = get_visible_window_infos()
+        for info in sorted(windows, key=lambda window: window["hwnd"] in before_hwnds):
+            title = (info.get("title") or "").lower()
+            if target_stem and target_stem in title:
+                set_window_rect(info["hwnd"], rect, bool(window.get("maximized")))
+                return
+            if exe_path and os.path.normcase(get_process_image_path(info["pid"])) == exe_path and title_hint and title_hint in title:
+                set_window_rect(info["hwnd"], rect, bool(window.get("maximized")))
+                return
+        time.sleep(0.2)
 
 
 def find_group(data: dict, key: str) -> dict | None:
@@ -292,7 +321,31 @@ def get_foreground_window_info() -> dict:
     if not pid.value:
         raise RuntimeError("没有读取到窗口进程。")
 
-    return {"hwnd": hwnd, "pid": pid.value, "title": get_window_text(hwnd)}
+    return {"hwnd": hwnd, "pid": pid.value, "title": get_window_text(hwnd), "window": get_window_state(hwnd)}
+
+
+def get_window_state(hwnd: int) -> dict:
+    rect = wintypes.RECT()
+    if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return {}
+    return {
+        "rect": {
+            "x": int(rect.left),
+            "y": int(rect.top),
+            "width": int(rect.right - rect.left),
+            "height": int(rect.bottom - rect.top),
+        },
+        "maximized": bool(ctypes.windll.user32.IsZoomed(hwnd)),
+    }
+
+
+def set_window_rect(hwnd: int, rect: dict, maximized: bool = False) -> None:
+    user32 = ctypes.windll.user32
+    user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
+    user32.ShowWindow(hwnd, 9)
+    user32.SetWindowPos(hwnd, 0, int(rect["x"]), int(rect["y"]), int(rect["width"]), int(rect["height"]), 0x0014)
+    if maximized:
+        user32.ShowWindow(hwnd, 3)
 
 
 def get_window_pid(hwnd: int) -> int:
@@ -315,7 +368,7 @@ def get_visible_window_infos() -> list[dict]:
         pid = get_window_pid(hwnd)
         if not pid or pid == own_pid:
             return True
-        windows.append({"hwnd": hwnd, "pid": pid, "title": title})
+        windows.append({"hwnd": hwnd, "pid": pid, "title": title, "window": get_window_state(hwnd)})
         return True
 
     ctypes.windll.user32.EnumWindows(enum_proc_type(callback), 0)
@@ -509,14 +562,15 @@ def get_open_office_document_paths(exe_path: str) -> list[str]:
 
 def capture_window_launch_items(info: dict, command_line: str | None = None) -> tuple[list[dict], list[str]]:
     exe_path = get_process_image_path(info["pid"])
+    window = {"title": info.get("title", ""), "exe": exe_path, **(info.get("window") or {})}
     office_paths = get_open_office_document_paths(exe_path)
     if office_paths:
-        items = [{"path": path, "args": "", "enabled": True} for path in office_paths]
+        items = [{"path": path, "args": "", "enabled": True, "window": window} for path in office_paths]
         return items, [f"文件：{Path(path).name}" for path in office_paths]
 
     command_line = command_line if command_line is not None else get_process_command_line(info["pid"])
     target, args, target_type = choose_captured_target(exe_path, command_line)
-    item = {"path": target, "args": args, "enabled": True}
+    item = {"path": target, "args": args, "enabled": True, "window": window}
     title = info.get("title") or Path(target).name or target
     return [item], [f"{target_type}：{title}"]
 
