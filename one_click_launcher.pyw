@@ -38,7 +38,7 @@ from tkinter import (
 
 
 APP_NAME = "一键启动"
-APP_VERSION = "v0.4.13-demo"
+APP_VERSION = "v0.4.16-demo"
 CONFIG_FILE = "launcher_config.json"
 OFFICE_CAPTURE_SPECS = (
     ({"wps", "kwps", "et", "ket", "wpp", "kwpp"}, "KWPS.Application", "Documents"),
@@ -782,9 +782,13 @@ class LauncherApp:
     def __init__(self, root: Tk):
         self.root = root
         self.root.title(f"{APP_NAME} {APP_VERSION}")
-        self.root.geometry("860x520")
-        self.root.minsize(700, 460)
         self.data = load_config()
+        geometry = self.data.get("app_geometry", "")
+        self.root.geometry(geometry if re.match(r"^\d+x\d+([+-]\d+){0,2}$", geometry) else "860x520")
+        self.root.minsize(700, 460)
+        if self.data.get("app_window_state") == "zoomed":
+            self.root.after(0, lambda: self.root.state("zoomed"))
+        self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.selected_group_id = None
         self.selected_rule_group_id = None
         self.status = StringVar(value="配置已自动保存在本机。")
@@ -792,6 +796,14 @@ class LauncherApp:
         self.build_ui()
         self.refresh_groups()
         self.refresh_rule_groups()
+
+    def close(self) -> None:
+        state = self.root.state()
+        if state == "normal":
+            self.data["app_geometry"] = self.root.geometry()
+        self.data["app_window_state"] = state
+        save_config(self.data)
+        self.root.destroy()
 
     def setup_style(self) -> None:
         style = ttk.Style(self.root)
@@ -833,6 +845,7 @@ class LauncherApp:
         group_scroll = ttk.Scrollbar(group_wrap, orient=VERTICAL)
         self.group_list = Listbox(
             group_wrap,
+            height=5,
             exportselection=False,
             activestyle="dotbox",
             selectmode=SINGLE,
@@ -883,6 +896,7 @@ class LauncherApp:
             columns=("delete", "name", "path"),
             show="headings",
             selectmode="browse",
+            height=5,
         )
         self.item_tree.heading("delete", text="操作")
         self.item_tree.heading("name", text="名称")
@@ -921,7 +935,7 @@ class LauncherApp:
         menu.add_cascade(label="操作", menu=app_menu)
         app_menu.add_command(label="创建一键启动桌面快捷方式", command=self.create_manager_shortcut)
         app_menu.add_command(label="打开程序目录", command=lambda: os.startfile(str(app_dir())))
-        app_menu.add_command(label="关于", command=self.show_about)
+        menu.add_command(label="关于", command=self.show_about)
 
         self.build_rules_ui(rules_tab)
 
@@ -941,6 +955,7 @@ class LauncherApp:
         rule_group_scroll = ttk.Scrollbar(rule_group_wrap, orient=VERTICAL)
         self.rule_group_list = Listbox(
             rule_group_wrap,
+            height=5,
             exportselection=False,
             activestyle="dotbox",
             selectmode=SINGLE,
@@ -993,6 +1008,7 @@ class LauncherApp:
             columns=("delete", "name", "path"),
             show="headings",
             selectmode="browse",
+            height=5,
         )
         self.rule_tree.heading("delete", text="操作")
         self.rule_tree.heading("name", text="名称")
@@ -1691,7 +1707,7 @@ class LauncherApp:
         self.status.set(f"已创建桌面快捷方式：{shortcut.name}")
 
     def show_about(self) -> None:
-        messagebox.showinfo(APP_NAME, f"{APP_NAME}\n版本：{APP_VERSION}")
+        messagebox.showinfo(APP_NAME, f"{APP_NAME}\n版本：{APP_VERSION}\n作者：时光的星阵")
 
 
 def parse_args() -> argparse.Namespace:
