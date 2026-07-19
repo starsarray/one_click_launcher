@@ -38,7 +38,7 @@ from tkinter import (
 
 
 APP_NAME = "一键启动"
-APP_VERSION = "v0.4.16-demo"
+APP_VERSION = "v0.4.20-demo"
 CONFIG_FILE = "launcher_config.json"
 OFFICE_CAPTURE_SPECS = (
     ({"wps", "kwps", "et", "ket", "wpp", "kwpp"}, "KWPS.Application", "Documents"),
@@ -187,25 +187,29 @@ def launch_item(item: dict) -> str | None:
 def restore_item_window(item: dict, before_hwnds: set[int] | None = None) -> None:
     window = item.get("window") or {}
     rect = window.get("rect") or {}
-    if not all(key in rect for key in ("x", "y", "width", "height")):
+    if not valid_window_rect(rect):
         return
 
     target = expand_target(item.get("path", ""))
     target_stem = Path(target).stem.lower()
     exe_path = os.path.normcase(window.get("exe", ""))
-    title_hint = (window.get("title") or "").lower()
     before_hwnds = before_hwnds or set()
 
-    for _ in range(40):
-        windows = get_visible_window_infos()
-        for info in sorted(windows, key=lambda window: window["hwnd"] in before_hwnds):
+    for attempt in range(40):
+        fallback = None
+        for info in get_visible_window_infos():
             title = (info.get("title") or "").lower()
-            if target_stem and target_stem in title:
+            matched = (target_stem and target_stem in title) or (exe_path and os.path.normcase(get_process_image_path(info["pid"])) == exe_path)
+            if not matched:
+                continue
+            if info["hwnd"] not in before_hwnds:
                 set_window_rect(info["hwnd"], rect, bool(window.get("maximized")))
                 return
-            if exe_path and os.path.normcase(get_process_image_path(info["pid"])) == exe_path and title_hint and title_hint in title:
-                set_window_rect(info["hwnd"], rect, bool(window.get("maximized")))
-                return
+            if info["hwnd"] == ctypes.windll.user32.GetForegroundWindow():
+                fallback = info
+        if fallback and attempt >= 5:
+            set_window_rect(fallback["hwnd"], rect, bool(window.get("maximized")))
+            return
         time.sleep(0.2)
 
 
@@ -325,10 +329,12 @@ def get_foreground_window_info() -> dict:
 
 
 def get_window_state(hwnd: int) -> dict:
+    if ctypes.windll.user32.IsIconic(hwnd):
+        return {}
     rect = wintypes.RECT()
     if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
         return {}
-    return {
+    state = {
         "rect": {
             "x": int(rect.left),
             "y": int(rect.top),
@@ -337,15 +343,29 @@ def get_window_state(hwnd: int) -> dict:
         },
         "maximized": bool(ctypes.windll.user32.IsZoomed(hwnd)),
     }
+    return state if valid_window_rect(state["rect"]) else {}
+
+
+def valid_window_rect(rect: dict) -> bool:
+    return (
+        all(key in rect for key in ("x", "y", "width", "height"))
+        and int(rect["width"]) > 0
+        and int(rect["height"]) > 0
+        and int(rect["x"]) > -10000
+        and int(rect["y"]) > -10000
+    )
 
 
 def set_window_rect(hwnd: int, rect: dict, maximized: bool = False) -> None:
     user32 = ctypes.windll.user32
     user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
-    user32.ShowWindow(hwnd, 9)
-    user32.SetWindowPos(hwnd, 0, int(rect["x"]), int(rect["y"]), int(rect["width"]), int(rect["height"]), 0x0014)
-    if maximized:
-        user32.ShowWindow(hwnd, 3)
+    for _ in range(5):
+        if maximized:
+            user32.ShowWindow(hwnd, 3)
+        else:
+            user32.ShowWindow(hwnd, 9)
+            user32.SetWindowPos(hwnd, 0, int(rect["x"]), int(rect["y"]), int(rect["width"]), int(rect["height"]), 0x0014)
+        time.sleep(0.2)
 
 
 def get_window_pid(hwnd: int) -> int:
