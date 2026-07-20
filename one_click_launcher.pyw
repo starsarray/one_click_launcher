@@ -38,7 +38,7 @@ from tkinter import (
 
 
 APP_NAME = "一键启动"
-APP_VERSION = "v0.4.20-demo"
+APP_VERSION = "v0.4.34-demo"
 CONFIG_FILE = "launcher_config.json"
 OFFICE_CAPTURE_SPECS = (
     ({"wps", "kwps", "et", "ket", "wpp", "kwpp"}, "KWPS.Application", "Documents"),
@@ -71,6 +71,21 @@ class GUID(ctypes.Structure):
             guid.time_hi_version,
             (wintypes.BYTE * 8)(*guid.bytes[8:]),
         )
+
+
+class POINT(ctypes.Structure):
+    _fields_ = [("x", ctypes.c_long), ("y", ctypes.c_long)]
+
+
+class WINDOWPLACEMENT(ctypes.Structure):
+    _fields_ = [
+        ("length", ctypes.c_uint),
+        ("flags", ctypes.c_uint),
+        ("showCmd", ctypes.c_uint),
+        ("ptMinPosition", POINT),
+        ("ptMaxPosition", POINT),
+        ("rcNormalPosition", wintypes.RECT),
+    ]
 
 
 def app_dir() -> Path:
@@ -162,7 +177,7 @@ def expand_target(target: str) -> str:
     return os.path.expandvars(os.path.expanduser(target.strip()))
 
 
-def launch_item(item: dict) -> str | None:
+def launch_item(item: dict, restore_threads: list[threading.Thread] | None = None) -> str | None:
     target = expand_target(item.get("path", ""))
     if not target:
         return "空路径"
@@ -171,7 +186,8 @@ def launch_item(item: dict) -> str | None:
     if not is_url(target) and not Path(target).exists():
         return f"不存在：{target}"
 
-    before_hwnds = {window["hwnd"] for window in get_visible_window_infos()} if item.get("window") else set()
+    window = item.get("window") or {}
+    before_hwnds = {window["hwnd"] for window in get_visible_window_infos()} if valid_window_rect(window.get("rect") or {}) else set()
     try:
         if args:
             os.startfile(target, arguments=args)
@@ -179,8 +195,11 @@ def launch_item(item: dict) -> str | None:
             os.startfile(target)
     except Exception as exc:
         return f"{target}：{exc}"
-    if item.get("window"):
-        threading.Thread(target=restore_item_window, args=(item, before_hwnds), daemon=True).start()
+    if before_hwnds:
+        thread = threading.Thread(target=restore_item_window, args=(item, before_hwnds), daemon=True)
+        thread.start()
+        if restore_threads is not None:
+            restore_threads.append(thread)
     return None
 
 
@@ -196,7 +215,6 @@ def restore_item_window(item: dict, before_hwnds: set[int] | None = None) -> Non
     before_hwnds = before_hwnds or set()
 
     for attempt in range(40):
-        fallback = None
         for info in get_visible_window_infos():
             title = (info.get("title") or "").lower()
             matched = (target_stem and target_stem in title) or (exe_path and os.path.normcase(get_process_image_path(info["pid"])) == exe_path)
@@ -205,11 +223,6 @@ def restore_item_window(item: dict, before_hwnds: set[int] | None = None) -> Non
             if info["hwnd"] not in before_hwnds:
                 set_window_rect(info["hwnd"], rect, bool(window.get("maximized")))
                 return
-            if info["hwnd"] == ctypes.windll.user32.GetForegroundWindow():
-                fallback = info
-        if fallback and attempt >= 5:
-            set_window_rect(fallback["hwnd"], rect, bool(window.get("maximized")))
-            return
         time.sleep(0.2)
 
 
@@ -283,7 +296,7 @@ def item_blocked_by_active_rules(data: dict, item: dict) -> bool:
     return False
 
 
-def launch_group(group_key: str, show_done: bool = False) -> int:
+def launch_group(group_key: str, show_done: bool = False, wait_restore: bool = True) -> int:
     data = load_config()
     group = find_group(data, group_key)
     if not group:
@@ -291,11 +304,15 @@ def launch_group(group_key: str, show_done: bool = False) -> int:
         return 1
 
     failures = []
+    restore_threads = []
     for item in group.get("items", []):
         if item.get("enabled", True):
-            error = launch_item(item)
+            error = launch_item(item, restore_threads)
             if error:
                 failures.append(error)
+    if wait_restore:
+        for thread in restore_threads:
+            thread.join()
 
     if failures:
         messagebox.showwarning(APP_NAME, "部分项目启动失败：\n\n" + "\n".join(failures))
@@ -329,10 +346,17 @@ def get_foreground_window_info() -> dict:
 
 
 def get_window_state(hwnd: int) -> dict:
-    if ctypes.windll.user32.IsIconic(hwnd):
-        return {}
+    user32 = ctypes.windll.user32
     rect = wintypes.RECT()
-    if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+    maximized = bool(user32.IsZoomed(hwnd))
+    if user32.IsIconic(hwnd):
+        placement = WINDOWPLACEMENT()
+        placement.length = ctypes.sizeof(WINDOWPLACEMENT)
+        if not user32.GetWindowPlacement(hwnd, ctypes.byref(placement)):
+            return {}
+        rect = placement.rcNormalPosition
+        maximized = bool(placement.flags & 0x0002)
+    elif not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
         return {}
     state = {
         "rect": {
@@ -341,7 +365,7 @@ def get_window_state(hwnd: int) -> dict:
             "width": int(rect.right - rect.left),
             "height": int(rect.bottom - rect.top),
         },
-        "maximized": bool(ctypes.windll.user32.IsZoomed(hwnd)),
+        "maximized": maximized,
     }
     return state if valid_window_rect(state["rect"]) else {}
 
@@ -359,13 +383,10 @@ def valid_window_rect(rect: dict) -> bool:
 def set_window_rect(hwnd: int, rect: dict, maximized: bool = False) -> None:
     user32 = ctypes.windll.user32
     user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
-    for _ in range(5):
-        if maximized:
-            user32.ShowWindow(hwnd, 3)
-        else:
-            user32.ShowWindow(hwnd, 9)
-            user32.SetWindowPos(hwnd, 0, int(rect["x"]), int(rect["y"]), int(rect["width"]), int(rect["height"]), 0x0014)
-        time.sleep(0.2)
+    user32.ShowWindow(hwnd, 9)
+    user32.SetWindowPos(hwnd, 0, int(rect["x"]), int(rect["y"]), int(rect["width"]), int(rect["height"]), 0x0014)
+    if maximized:
+        user32.ShowWindow(hwnd, 3)
 
 
 def get_window_pid(hwnd: int) -> int:
@@ -522,7 +543,7 @@ def choose_captured_target(exe_path: str, command_line: str) -> tuple[str, str, 
             return candidate, "", "文件"
 
     if exe_path:
-        return exe_path, "", "软件"
+        return exe_path, subprocess.list2cmdline(args[1:]), "软件"
     raise RuntimeError("没有识别到可启动的文件或软件。")
 
 
@@ -580,17 +601,48 @@ def get_open_office_document_paths(exe_path: str) -> list[str]:
     return paths
 
 
+def get_explorer_folder_path(hwnd: int) -> str:
+    try:
+        import pythoncom
+        import win32com.client
+    except Exception:
+        return ""
+
+    pythoncom.CoInitialize()
+    try:
+        shell = win32com.client.Dispatch("Shell.Application")
+        for window in shell.Windows():
+            try:
+                if int(window.HWND) != int(hwnd):
+                    continue
+                path = normalize_capture_value(str(window.LocationURL or ""))
+                return path if path and Path(path).is_dir() else ""
+            except Exception:
+                continue
+    finally:
+        pythoncom.CoUninitialize()
+    return ""
+
+
 def capture_window_launch_items(info: dict, command_line: str | None = None) -> tuple[list[dict], list[str]]:
     exe_path = get_process_image_path(info["pid"])
     window = {"title": info.get("title", ""), "exe": exe_path, **(info.get("window") or {})}
+    if not valid_window_rect(window.get("rect") or {}):
+        window = {}
+    if Path(exe_path).name.lower() == "explorer.exe":
+        folder_path = get_explorer_folder_path(info["hwnd"])
+        if not folder_path:
+            raise RuntimeError("跳过后台资源管理器。")
+        item = {"path": folder_path, "args": "", "enabled": True, **({"window": window} if window else {})}
+        return [item], [f"文件夹：{Path(folder_path).name or folder_path}"]
     office_paths = get_open_office_document_paths(exe_path)
     if office_paths:
-        items = [{"path": path, "args": "", "enabled": True, "window": window} for path in office_paths]
+        items = [{"path": path, "args": "", "enabled": True, **({"window": window} if window else {})} for path in office_paths]
         return items, [f"文件：{Path(path).name}" for path in office_paths]
 
     command_line = command_line if command_line is not None else get_process_command_line(info["pid"])
     target, args, target_type = choose_captured_target(exe_path, command_line)
-    item = {"path": target, "args": args, "enabled": True, "window": window}
+    item = {"path": target, "args": args, "enabled": True, **({"window": window} if window else {})}
     title = info.get("title") or Path(target).name or target
     return [item], [f"{target_type}：{title}"]
 
@@ -601,9 +653,6 @@ def capture_window_launch_item(info: dict, command_line: str | None = None) -> t
 
 
 def should_skip_capture_item(item: dict) -> bool:
-    path = item.get("path", "")
-    if Path(path).name.lower() == "explorer.exe" and not item.get("args", "").strip():
-        return True
     return False
 
 
@@ -902,8 +951,9 @@ class LauncherApp:
         ttk.Label(top, text="当前工作组：", style="Title.TLabel").grid(row=0, column=0, sticky="w")
         self.group_name = StringVar(value="未选择")
         ttk.Label(top, textvariable=self.group_name, anchor=W).grid(row=0, column=1, sticky="ew")
-        ttk.Button(top, text="创建桌面快捷方式", command=self.create_group_shortcut).grid(row=0, column=2, sticky="e", padx=(8, 0))
-        ttk.Button(top, text="运行", command=self.run_selected_group, style="Primary.TButton").grid(row=0, column=3, sticky="e", padx=(8, 0))
+        ttk.Button(top, text="清空当前工作组", command=self.clear_current_group_items).grid(row=0, column=2, sticky="e", padx=(8, 0))
+        ttk.Button(top, text="创建桌面快捷方式", command=self.create_group_shortcut).grid(row=0, column=3, sticky="e", padx=(8, 0))
+        ttk.Button(top, text="运行", command=self.run_selected_group, style="Primary.TButton").grid(row=0, column=4, sticky="e", padx=(8, 0))
 
         ttk.Label(right, text="启动项目", anchor=W, style="Section.TLabel").grid(row=1, column=0, sticky="ew", pady=(14, 0))
         item_wrap = ttk.Frame(right)
@@ -1182,8 +1232,6 @@ class LauncherApp:
         group = self.current_rule_group()
         if not group:
             return
-        if not messagebox.askyesno(APP_NAME, f"删除规则组“{group.get('name', '')}”？"):
-            return
         active_ids = [group_id for group_id in active_rule_group_ids(self.data) if group_id != group.get("id")]
         self.data["active_rule_group_ids"] = active_ids
         self.data["rule_groups"] = [g for g in self.data.get("rule_groups", []) if g.get("id") != group.get("id")]
@@ -1344,8 +1392,6 @@ class LauncherApp:
     def delete_group(self) -> None:
         group = self.current_group()
         if not group:
-            return
-        if not messagebox.askyesno(APP_NAME, f"删除工作组“{group.get('name', '')}”？"):
             return
         shortcut_name = f"{safe_shortcut_name(group.get('name', '未命名工作组'))}.lnk"
         shortcut_path = group.get("shortcut_path", "")
@@ -1657,6 +1703,19 @@ class LauncherApp:
         self.refresh_items()
         self.status.set("已删除项目。")
 
+    def clear_current_group_items(self) -> None:
+        group = self.current_group()
+        if not group:
+            messagebox.showinfo(APP_NAME, "请先选择一个工作组。")
+            return
+        if not group.get("items"):
+            self.status.set("当前工作组已经是空的。")
+            return
+        group["items"] = []
+        save_config(self.data)
+        self.refresh_items()
+        self.status.set("已清空当前工作组。")
+
     def run_selected_item(self) -> None:
         item, _index = self.selected_item()
         if not item:
@@ -1670,7 +1729,7 @@ class LauncherApp:
         if not group:
             messagebox.showinfo(APP_NAME, "请先选择一个工作组。")
             return
-        launch_group(group.get("id"), show_done=True)
+        launch_group(group.get("id"), wait_restore=False)
 
     def shortcut_args_for_group(self, group: dict) -> str:
         if getattr(sys, "frozen", False):
@@ -1689,8 +1748,6 @@ class LauncherApp:
             return
         desktop = get_desktop_dir()
         shortcut = desktop / f"{safe_shortcut_name(group.get('name', '未命名工作组'))}.lnk"
-        if shortcut.exists() and not messagebox.askyesno(APP_NAME, f"快捷方式“{shortcut.name}”已存在，覆盖吗？"):
-            return
         try:
             create_shortcut(
                 shortcut,
@@ -1710,8 +1767,6 @@ class LauncherApp:
     def create_manager_shortcut(self) -> None:
         desktop = get_desktop_dir()
         shortcut = desktop / f"{APP_NAME}.lnk"
-        if shortcut.exists() and not messagebox.askyesno(APP_NAME, f"快捷方式“{shortcut.name}”已存在，覆盖吗？"):
-            return
         try:
             create_shortcut(
                 shortcut,
