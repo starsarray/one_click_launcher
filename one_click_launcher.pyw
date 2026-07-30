@@ -38,7 +38,7 @@ from tkinter import (
 
 
 APP_NAME = "一键启动"
-APP_VERSION = "v0.4.34-demo"
+APP_VERSION = "v0.4.36-demo"
 CONFIG_FILE = "launcher_config.json"
 OFFICE_CAPTURE_SPECS = (
     ({"wps", "kwps", "et", "ket", "wpp", "kwpp"}, "KWPS.Application", "Documents"),
@@ -53,6 +53,16 @@ OFFICE_CAPTURE_SPECS = (
 
 def default_config() -> dict:
     return {"groups": [], "rule_groups": [], "active_rule_group_ids": []}
+
+
+def enable_dpi_awareness() -> None:
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(1)
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()
+        except Exception:
+            pass
 
 
 class GUID(ctypes.Structure):
@@ -177,8 +187,63 @@ def expand_target(target: str) -> str:
     return os.path.expandvars(os.path.expanduser(target.strip()))
 
 
+def powershell_quote(value: str) -> str:
+    return "'" + value.replace("'", "''") + "'"
+
+
+def latest_windowsapps_target(target: str) -> str:
+    path = Path(target)
+    parts = path.parts
+    for index, part in enumerate(parts):
+        if part.lower() != "windowsapps" or index + 1 >= len(parts):
+            continue
+        package = parts[index + 1]
+        if "_" not in package or "__" not in package:
+            return ""
+        prefix = package.split("_", 1)[0]
+        publisher = package.rsplit("__", 1)[1]
+        rest = Path(*parts[index + 2:])
+        base = Path(*parts[: index + 1])
+        pattern = f"{prefix}_*__{publisher}"
+        script = (
+            "$ErrorActionPreference='SilentlyContinue'; "
+            f"Get-ChildItem -LiteralPath {powershell_quote(str(base))} -Directory -Filter {powershell_quote(pattern)} | "
+            f"ForEach-Object {{ Join-Path $_.FullName {powershell_quote(str(rest))} }} | "
+            "Where-Object { Test-Path -LiteralPath $_ } | Sort-Object | Select-Object -Last 1"
+        )
+        try:
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-Command", script],
+                capture_output=True,
+                text=True,
+                timeout=3,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except Exception:
+            return ""
+        return result.stdout.strip()
+    return ""
+
+
+def resolve_launch_target(target: str) -> str:
+    if target and Path(target).exists():
+        return target
+    return latest_windowsapps_target(target) or running_replacement_target(target) or target
+
+
+def running_replacement_target(target: str) -> str:
+    name = Path(target).name.lower()
+    if not name:
+        return ""
+    for info in get_visible_window_infos():
+        exe_path = get_process_image_path(info["pid"])
+        if Path(exe_path).name.lower() == name and Path(exe_path).exists():
+            return exe_path
+    return ""
+
+
 def launch_item(item: dict, restore_threads: list[threading.Thread] | None = None) -> str | None:
-    target = expand_target(item.get("path", ""))
+    target = resolve_launch_target(expand_target(item.get("path", "")))
     if not target:
         return "空路径"
 
@@ -209,21 +274,28 @@ def restore_item_window(item: dict, before_hwnds: set[int] | None = None) -> Non
     if not valid_window_rect(rect):
         return
 
-    target = expand_target(item.get("path", ""))
+    target = resolve_launch_target(expand_target(item.get("path", "")))
     target_stem = Path(target).stem.lower()
     exe_path = os.path.normcase(window.get("exe", ""))
     before_hwnds = before_hwnds or set()
 
     for attempt in range(40):
         for info in get_visible_window_infos():
-            title = (info.get("title") or "").lower()
-            matched = (target_stem and target_stem in title) or (exe_path and os.path.normcase(get_process_image_path(info["pid"])) == exe_path)
+            matched = window_matches_item(info, target, target_stem, exe_path)
             if not matched:
                 continue
             if info["hwnd"] not in before_hwnds:
                 set_window_rect(info["hwnd"], rect, bool(window.get("maximized")))
                 return
         time.sleep(0.2)
+
+
+def window_matches_item(info: dict, target: str, target_stem: str, exe_path: str) -> bool:
+    current_exe = get_process_image_path(info["pid"])
+    if Path(target).is_dir():
+        return Path(current_exe).name.lower() == "explorer.exe" and normalize_rule_path(get_explorer_folder_path(info["hwnd"])) == normalize_rule_path(target)
+    title = (info.get("title") or "").lower()
+    return (target_stem and target_stem in title) or (exe_path and os.path.normcase(current_exe) == exe_path)
 
 
 def find_group(data: dict, key: str) -> dict | None:
@@ -1792,6 +1864,7 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    enable_dpi_awareness()
     args = parse_args()
     if args.run:
         root = Tk()
@@ -1801,10 +1874,6 @@ def main() -> int:
         return code
 
     root = Tk()
-    try:
-        ctypes.windll.shcore.SetProcessDpiAwareness(1)
-    except Exception:
-        pass
     LauncherApp(root)
     root.mainloop()
     return 0
