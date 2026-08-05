@@ -38,7 +38,7 @@ from tkinter import (
 
 
 APP_NAME = "一键启动"
-APP_VERSION = "v0.4.36-demo"
+APP_VERSION = "v0.4.37-demo"
 CONFIG_FILE = "launcher_config.json"
 OFFICE_CAPTURE_SPECS = (
     ({"wps", "kwps", "et", "ket", "wpp", "kwpp"}, "KWPS.Application", "Documents"),
@@ -295,6 +295,8 @@ def window_matches_item(info: dict, target: str, target_stem: str, exe_path: str
     if Path(target).is_dir():
         return Path(current_exe).name.lower() == "explorer.exe" and normalize_rule_path(get_explorer_folder_path(info["hwnd"])) == normalize_rule_path(target)
     title = (info.get("title") or "").lower()
+    if Path(target).is_file() and Path(target).suffix.lower() not in {".exe", ".com", ".bat", ".cmd", ".lnk"}:
+        return bool(target_stem and target_stem in title)
     return (target_stem and target_stem in title) or (exe_path and os.path.normcase(current_exe) == exe_path)
 
 
