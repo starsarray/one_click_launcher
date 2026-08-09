@@ -38,8 +38,9 @@ from tkinter import (
 
 
 APP_NAME = "一键启动"
-APP_VERSION = "v0.4.37-demo"
+APP_VERSION = "v0.4.38-demo"
 CONFIG_FILE = "launcher_config.json"
+SAME_APP_DELAY_SECONDS = 0.05
 OFFICE_CAPTURE_SPECS = (
     ({"wps", "kwps", "et", "ket", "wpp", "kwpp"}, "KWPS.Application", "Documents"),
     ({"wps", "kwps", "et", "ket", "wpp", "kwpp"}, "KET.Application", "Workbooks"),
@@ -242,7 +243,7 @@ def running_replacement_target(target: str) -> str:
     return ""
 
 
-def launch_item(item: dict, restore_threads: list[threading.Thread] | None = None) -> str | None:
+def launch_item(item: dict, restore_threads: list[threading.Thread] | None = None, claimed_windows: tuple[set[int], threading.Lock] | None = None) -> str | None:
     target = resolve_launch_target(expand_target(item.get("path", "")))
     if not target:
         return "空路径"
@@ -252,23 +253,28 @@ def launch_item(item: dict, restore_threads: list[threading.Thread] | None = Non
         return f"不存在：{target}"
 
     window = item.get("window") or {}
-    before_hwnds = {window["hwnd"] for window in get_visible_window_infos()} if valid_window_rect(window.get("rect") or {}) else set()
+    should_restore = valid_window_rect(window.get("rect") or {})
+    before_hwnds = {window["hwnd"] for window in get_visible_window_infos(include_untitled=True)} if should_restore else set()
+    launched_pid = 0
     try:
-        if args:
+        opener = resolve_launch_target(window.get("exe", ""))
+        if Path(target).is_file() and Path(opener).is_file() and Path(target).suffix.lower() not in {".exe", ".com", ".bat", ".cmd", ".lnk"}:
+            launched_pid = subprocess.Popen([opener, target]).pid
+        elif args:
             os.startfile(target, arguments=args)
         else:
             os.startfile(target)
     except Exception as exc:
         return f"{target}：{exc}"
-    if before_hwnds:
-        thread = threading.Thread(target=restore_item_window, args=(item, before_hwnds), daemon=True)
+    if should_restore:
+        thread = threading.Thread(target=restore_item_window, args=(item, before_hwnds, claimed_windows, launched_pid), daemon=True)
         thread.start()
         if restore_threads is not None:
             restore_threads.append(thread)
     return None
 
 
-def restore_item_window(item: dict, before_hwnds: set[int] | None = None) -> None:
+def restore_item_window(item: dict, before_hwnds: set[int] | None = None, claimed_windows: tuple[set[int], threading.Lock] | None = None, launched_pid: int = 0) -> None:
     window = item.get("window") or {}
     rect = window.get("rect") or {}
     if not valid_window_rect(rect):
@@ -279,25 +285,28 @@ def restore_item_window(item: dict, before_hwnds: set[int] | None = None) -> Non
     exe_path = os.path.normcase(window.get("exe", ""))
     before_hwnds = before_hwnds or set()
 
-    for attempt in range(40):
-        for info in get_visible_window_infos():
-            matched = window_matches_item(info, target, target_stem, exe_path)
-            if not matched:
+    for attempt in range(800):
+        for info in get_visible_window_infos(include_untitled=True):
+            if info["hwnd"] in before_hwnds:
                 continue
-            if info["hwnd"] not in before_hwnds:
-                set_window_rect(info["hwnd"], rect, bool(window.get("maximized")))
-                return
-        time.sleep(0.2)
+            if info["pid"] != launched_pid and (launched_pid and attempt < 50 or not window_matches_item(info, target, target_stem, exe_path)):
+                continue
+            if claimed_windows:
+                claimed, lock = claimed_windows
+                with lock:
+                    if info["hwnd"] in claimed:
+                        continue
+                    claimed.add(info["hwnd"])
+            set_window_rect(info["hwnd"], rect, bool(window.get("maximized")))
+            return
+        time.sleep(0.01)
 
 
 def window_matches_item(info: dict, target: str, target_stem: str, exe_path: str) -> bool:
     current_exe = get_process_image_path(info["pid"])
     if Path(target).is_dir():
         return Path(current_exe).name.lower() == "explorer.exe" and normalize_rule_path(get_explorer_folder_path(info["hwnd"])) == normalize_rule_path(target)
-    title = (info.get("title") or "").lower()
-    if Path(target).is_file() and Path(target).suffix.lower() not in {".exe", ".com", ".bat", ".cmd", ".lnk"}:
-        return bool(target_stem and target_stem in title)
-    return (target_stem and target_stem in title) or (exe_path and os.path.normcase(current_exe) == exe_path)
+    return bool(exe_path and os.path.normcase(current_exe) == os.path.normcase(exe_path))
 
 
 def find_group(data: dict, key: str) -> dict | None:
@@ -379,11 +388,18 @@ def launch_group(group_key: str, show_done: bool = False, wait_restore: bool = T
 
     failures = []
     restore_threads = []
+    claimed_windows = (set(), threading.Lock())
+    launched_exes = set()
     for item in group.get("items", []):
         if item.get("enabled", True):
-            error = launch_item(item, restore_threads)
+            exe_key = os.path.normcase((item.get("window") or {}).get("exe", ""))
+            if exe_key in launched_exes:
+                time.sleep(SAME_APP_DELAY_SECONDS)
+            error = launch_item(item, restore_threads, claimed_windows)
             if error:
                 failures.append(error)
+            elif exe_key:
+                launched_exes.add(exe_key)
     if wait_restore:
         for thread in restore_threads:
             thread.join()
@@ -457,7 +473,8 @@ def valid_window_rect(rect: dict) -> bool:
 def set_window_rect(hwnd: int, rect: dict, maximized: bool = False) -> None:
     user32 = ctypes.windll.user32
     user32.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_uint]
-    user32.ShowWindow(hwnd, 9)
+    if user32.IsIconic(hwnd):
+        user32.ShowWindow(hwnd, 9)
     user32.SetWindowPos(hwnd, 0, int(rect["x"]), int(rect["y"]), int(rect["width"]), int(rect["height"]), 0x0014)
     if maximized:
         user32.ShowWindow(hwnd, 3)
@@ -469,7 +486,7 @@ def get_window_pid(hwnd: int) -> int:
     return pid.value
 
 
-def get_visible_window_infos() -> list[dict]:
+def get_visible_window_infos(include_untitled: bool = False) -> list[dict]:
     windows = []
     own_pid = os.getpid()
     enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
@@ -478,7 +495,7 @@ def get_visible_window_infos() -> list[dict]:
         if not ctypes.windll.user32.IsWindowVisible(hwnd):
             return True
         title = get_window_text(hwnd).strip()
-        if not title:
+        if not include_untitled and not title:
             return True
         pid = get_window_pid(hwnd)
         if not pid or pid == own_pid:
