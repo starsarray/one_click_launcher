@@ -38,9 +38,8 @@ from tkinter import (
 
 
 APP_NAME = "一键启动"
-APP_VERSION = "v0.4.38-demo"
+APP_VERSION = "v0.4.39-demo"
 CONFIG_FILE = "launcher_config.json"
-SAME_APP_DELAY_SECONDS = 0.05
 OFFICE_CAPTURE_SPECS = (
     ({"wps", "kwps", "et", "ket", "wpp", "kwpp"}, "KWPS.Application", "Documents"),
     ({"wps", "kwps", "et", "ket", "wpp", "kwpp"}, "KET.Application", "Workbooks"),
@@ -243,7 +242,7 @@ def running_replacement_target(target: str) -> str:
     return ""
 
 
-def launch_item(item: dict, restore_threads: list[threading.Thread] | None = None, claimed_windows: tuple[set[int], threading.Lock] | None = None) -> str | None:
+def launch_item(item: dict, restore_threads: list[threading.Thread] | None = None, claimed_windows: tuple[set[int], threading.Lock] | None = None, restore_now: bool = False) -> str | None:
     target = resolve_launch_target(expand_target(item.get("path", "")))
     if not target:
         return "空路径"
@@ -267,6 +266,9 @@ def launch_item(item: dict, restore_threads: list[threading.Thread] | None = Non
     except Exception as exc:
         return f"{target}：{exc}"
     if should_restore:
+        if restore_now:
+            restore_item_window(item, before_hwnds, claimed_windows)
+            return None
         thread = threading.Thread(target=restore_item_window, args=(item, before_hwnds, claimed_windows, launched_pid), daemon=True)
         thread.start()
         if restore_threads is not None:
@@ -389,17 +391,13 @@ def launch_group(group_key: str, show_done: bool = False, wait_restore: bool = T
     failures = []
     restore_threads = []
     claimed_windows = (set(), threading.Lock())
-    launched_exes = set()
+    exe_keys = [os.path.normcase((item.get("window") or {}).get("exe", "")) for item in group.get("items", []) if item.get("enabled", True)]
     for item in group.get("items", []):
         if item.get("enabled", True):
             exe_key = os.path.normcase((item.get("window") or {}).get("exe", ""))
-            if exe_key in launched_exes:
-                time.sleep(SAME_APP_DELAY_SECONDS)
-            error = launch_item(item, restore_threads, claimed_windows)
+            error = launch_item(item, restore_threads, claimed_windows, bool(exe_key and exe_keys.count(exe_key) > 1))
             if error:
                 failures.append(error)
-            elif exe_key:
-                launched_exes.add(exe_key)
     if wait_restore:
         for thread in restore_threads:
             thread.join()
